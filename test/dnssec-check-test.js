@@ -32,9 +32,7 @@ module.exports.dnssecSecureZoneProceedsToTlsa = test => {
         return [];
     };
 
-    const mockCheckDnssecSecure = async () => {
-        return { secure: true };
-    };
+    const mockCheckDnssecSecure = async () => ({ secure: true });
 
     mxConnect(
         {
@@ -84,9 +82,7 @@ module.exports.insecureZoneSkipsTlsa = test => {
         return [];
     };
 
-    const mockCheckDnssecSecure = async () => {
-        return { secure: false };
-    };
+    const mockCheckDnssecSecure = async () => ({ secure: false });
 
     mxConnect(
         {
@@ -378,9 +374,7 @@ module.exports.dnssecCheckReturningNullTreatedAsInsecure = test => {
         return [];
     };
 
-    const mockCheckDnssecSecure = async () => {
-        return null;
-    };
+    const mockCheckDnssecSecure = async () => null;
 
     mxConnect(
         {
