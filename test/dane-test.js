@@ -837,48 +837,73 @@ module.exports.verifyCertWithStringCertData = test => {
     test.done();
 };
 
+
 /**
- * Test extractSPKI with raw peer certificate (.pubkey Buffer)
+ * Helper: generate a real self-signed EC P-256 certificate.
+ * Returns { certDer, spkiDer, publicKey } where:
+ *   certDer  — full certificate in DER format (valid for X509Certificate)
+ *   spkiDer  — SubjectPublicKeyInfo in DER format (91 bytes for P-256)
+ *   publicKey — KeyObject
+ */
+function generateTestCert() {
+    const fs = require('fs');
+    const { execSync } = require('child_process');
+    const pid = process.pid;
+    const tmpKey = `/tmp/_dane_test_key_${pid}.pem`;
+    const tmpCert = `/tmp/_dane_test_cert_${pid}.der`;
+    const { privateKey, publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    fs.writeFileSync(tmpKey, privateKey.export({ type: 'pkcs8', format: 'pem' }));
+    execSync(`openssl req -new -x509 -key ${tmpKey} -subj "/CN=dane-test" -days 1 -outform DER -out ${tmpCert}`);
+    const certDer = fs.readFileSync(tmpCert);
+    try { fs.unlinkSync(tmpKey); } catch { /* ignore */ }
+    try { fs.unlinkSync(tmpCert); } catch { /* ignore */ }
+    const x509 = new nodeCrypto.X509Certificate(certDer);
+    const spkiDer = x509.publicKey.export({ type: 'spki', format: 'der' });
+    return { certDer, spkiDer, publicKey };
+}
+
+/**
+ * Build a mock raw peer cert (as returned by tls.getPeerCertificate()).
+ * .raw   = full DER certificate (valid)
+ * .pubkey = raw public key bytes (NOT SPKI — this is what Node.js actually provides)
+ */
+function makeRawPeerCert(certDer, spkiDer) {
+    return {
+        raw: certDer,
+        // Node's getPeerCertificate().pubkey is the raw key, not SPKI.
+        // For EC P-256: 65 bytes (04 || X || Y), whereas SPKI is 91 bytes.
+        pubkey: Buffer.from(spkiDer.subarray(spkiDer.length - 65))
+    };
+}
+
+/**
+ * Test extractSPKI with raw peer certificate (has .raw DER)
  *
- * Raw peer certs from tls.getPeerCertificate() have .pubkey (Buffer)
- * containing the SubjectPublicKeyInfo in DER format. The old code
- * checked .publicKey (undefined on raw certs) and returned null.
+ * Raw peer certs from tls.getPeerCertificate() have .pubkey (raw key bytes)
+ * and .raw (full DER cert). extractSPKI must use .raw to reconstruct the
+ * correct SPKI, because .pubkey is NOT the SPKI.
  */
 module.exports.extractSPKIRawPeerCert = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
-
-    // Simulate a raw peer cert from tls.getPeerCertificate()
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-        // Note: no .publicKey property — this is what raw peer certs look like
-    };
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     const result = dane.extractSPKI(rawPeerCert);
     test.ok(Buffer.isBuffer(result), 'Should return a Buffer');
-    test.ok(spkiDer.equals(result), 'Should return the .pubkey Buffer as SPKI');
+    test.ok(spkiDer.equals(result), 'Should return the correct SPKI DER');
     test.equal(result.length, spkiDer.length, 'Buffer length should match SPKI DER');
     test.done();
 };
 
 /**
  * Test extractSPKI with X509Certificate object (.publicKey KeyObject)
- *
- * X509Certificate objects have .publicKey as a KeyObject. The old code
- * called crypto.createPublicKey(KeyObject) which throws "Invalid key
- * object type public, expected private". The fix calls .export() directly.
  */
 module.exports.extractSPKIX509Certificate = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { certDer, spkiDer, publicKey } = generateTestCert();
 
     // Simulate an X509Certificate object: .publicKey is a KeyObject.
-    // The old code called crypto.createPublicKey(KeyObject) which throws
-    // "Invalid key object type public, expected private".
     const mockX509 = {
         publicKey, // KeyObject (PublicKeyObject)
-        raw: Buffer.from('fake-cert-der')
+        raw: certDer
     };
 
     const result = dane.extractSPKI(mockX509);
@@ -891,8 +916,7 @@ module.exports.extractSPKIX509Certificate = test => {
  * Test extractSPKI with PEM-encoded public key string
  */
 module.exports.extractSPKIPemString = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { spkiDer, publicKey } = generateTestCert();
     const spkiPem = publicKey.export({ type: 'spki', format: 'pem' });
 
     const mockCert = {
@@ -911,11 +935,10 @@ module.exports.extractSPKIPemString = test => {
  * Both cert representations must produce the same SPKI DER output.
  */
 module.exports.extractSPKIConsistentAcrossCertTypes = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { certDer, spkiDer, publicKey } = generateTestCert();
 
     // Simulate raw peer cert
-    const rawPeerCert = { pubkey: spkiDer };
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     // Simulate X509Certificate
     const x509Cert = { publicKey };
@@ -936,17 +959,10 @@ module.exports.extractSPKIConsistentAcrossCertTypes = test => {
  * Verifies the complete pipeline: extractSPKI → hash → compare against TLSA.
  */
 module.exports.verifyCertDaneEESPKISha256RawPeerCert = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { certDer, spkiDer } = generateTestCert();
     const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
-    // Simulate raw peer cert
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-    };
-
-    // TLSA record: usage=3 (DANE-EE), selector=1 (SPKI), mtype=1 (SHA-256)
     const tlsaRecords = [{
         usage: 3,
         selector: 1,
@@ -967,13 +983,12 @@ module.exports.verifyCertDaneEESPKISha256RawPeerCert = test => {
  * Test full DANE-EE (usage=3) SPKI SHA-256 verification with X509Certificate
  */
 module.exports.verifyCertDaneEESPKISha256X509Certificate = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { certDer, spkiDer, publicKey } = generateTestCert();
     const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
 
     // Simulate X509Certificate
     const x509Cert = {
-        raw: Buffer.from('fake-cert-der'),
+        raw: certDer,
         publicKey // KeyObject
     };
 
@@ -994,14 +1009,9 @@ module.exports.verifyCertDaneEESPKISha256X509Certificate = test => {
  * Test DANE-EE SPKI SHA-512 verification
  */
 module.exports.verifyCertDaneEESPKISha512 = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { certDer, spkiDer } = generateTestCert();
     const spkiHash = nodeCrypto.createHash('sha512').update(spkiDer).digest();
-
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-    };
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     const tlsaRecords = [{
         usage: 3,
@@ -1020,13 +1030,8 @@ module.exports.verifyCertDaneEESPKISha512 = test => {
  * Test DANE-EE SPKI full match (mtype=0, no hash)
  */
 module.exports.verifyCertDaneEESPKIFullMatch = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
-
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-    };
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     const tlsaRecords = [{
         usage: 3,
@@ -1044,13 +1049,8 @@ module.exports.verifyCertDaneEESPKIFullMatch = test => {
  * Test DANE-EE verification fails with wrong TLSA hash
  */
 module.exports.verifyCertDaneEEWrongHash = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
-
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-    };
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     const tlsaRecords = [{
         usage: 3,
@@ -1070,12 +1070,12 @@ module.exports.verifyCertDaneEEWrongHash = test => {
  * Test DANE-EE full cert (selector=0) verification
  */
 module.exports.verifyCertDaneEEFullCertSelector = test => {
-    const certDer = Buffer.from('test-certificate-data-in-der-format');
+    const { certDer } = generateTestCert();
     const certHash = nodeCrypto.createHash('sha256').update(certDer).digest();
 
     const rawPeerCert = {
         raw: certDer,
-        pubkey: Buffer.from('fake-spki')
+        pubkey: Buffer.from('irrelevant-for-selector-0')
     };
 
     const tlsaRecords = [{
@@ -1095,14 +1095,9 @@ module.exports.verifyCertDaneEEFullCertSelector = test => {
  * Test PKIX-EE (usage=1) SPKI verification with raw peer cert
  */
 module.exports.verifyCertPkixEESPKI = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { certDer, spkiDer } = generateTestCert();
     const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
-
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-    };
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     const tlsaRecords = [{
         usage: 1, // PKIX-EE
@@ -1121,14 +1116,9 @@ module.exports.verifyCertPkixEESPKI = test => {
  * Test createDaneVerifier end-to-end with correct TLSA (should pass)
  */
 module.exports.createDaneVerifierE2ECorrectTlsa = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { certDer, spkiDer } = generateTestCert();
     const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
-
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-    };
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     const tlsaRecords = [{
         usage: 3,
@@ -1156,13 +1146,8 @@ module.exports.createDaneVerifierE2ECorrectTlsa = test => {
  * Test createDaneVerifier end-to-end with wrong TLSA (should fail)
  */
 module.exports.createDaneVerifierE2EWrongTlsa = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
-
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-    };
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     const tlsaRecords = [{
         usage: 3,
@@ -1191,13 +1176,8 @@ module.exports.createDaneVerifierE2EWrongTlsa = test => {
  * Test createDaneVerifier with verify:false logs failure but returns undefined
  */
 module.exports.createDaneVerifierVerifyFalseLogsButPasses = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
-
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-    };
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     const tlsaRecords = [{
         usage: 3,
@@ -1224,13 +1204,12 @@ module.exports.createDaneVerifierVerifyFalseLogsButPasses = test => {
  * Test createDaneVerifier with X509Certificate-style cert
  */
 module.exports.createDaneVerifierE2EX509Certificate = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { certDer, spkiDer, publicKey } = generateTestCert();
     const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
 
     // Simulate X509Certificate (has .publicKey as KeyObject)
     const x509Cert = {
-        raw: Buffer.from('fake-cert-der'),
+        raw: certDer,
         publicKey
     };
 
@@ -1251,14 +1230,9 @@ module.exports.createDaneVerifierE2EX509Certificate = test => {
  * Test that multiple TLSA records are tried and first match wins
  */
 module.exports.verifyCertMultipleTlsaRecordsFirstMatchWins = test => {
-    const { publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-    const spkiDer = publicKey.export({ type: 'spki', format: 'der' });
+    const { certDer, spkiDer } = generateTestCert();
     const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
-
-    const rawPeerCert = {
-        raw: Buffer.from('fake-cert-der'),
-        pubkey: spkiDer
-    };
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
 
     const tlsaRecords = [
         {
@@ -1278,5 +1252,25 @@ module.exports.verifyCertMultipleTlsaRecordsFirstMatchWins = test => {
     const result = dane.verifyCertAgainstTlsa(rawPeerCert, tlsaRecords);
     test.equal(result.valid, true, 'Should match the second TLSA record');
     test.ok(result.matchedRecord.cert.equals(spkiHash), 'Matched record should be the correct one');
+    test.done();
+};
+
+/**
+ * Test that cert.pubkey (raw key) is NOT the same as SPKI DER,
+ * proving the bug that existed when extractSPKI returned cert.pubkey directly.
+ */
+module.exports.extractSPKIPubkeyIsNotSPKI = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    // cert.pubkey is the raw EC point (65 bytes), NOT the SPKI (91 bytes)
+    test.notEqual(rawPeerCert.pubkey.length, spkiDer.length,
+        'Raw pubkey length should differ from SPKI length');
+    test.ok(!rawPeerCert.pubkey.equals(spkiDer),
+        'Raw pubkey should NOT equal SPKI DER');
+
+    // But extractSPKI should return the correct SPKI
+    const result = dane.extractSPKI(rawPeerCert);
+    test.ok(spkiDer.equals(result), 'extractSPKI should return correct SPKI, not raw pubkey');
     test.done();
 };
