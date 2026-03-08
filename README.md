@@ -100,7 +100,7 @@ You can use a domain name or an email address as the target, for additional conf
     - **resolveTlsa(tlsaName)** - custom async function to resolve TLSA records. Receives the full TLSA query name (e.g., `_25._tcp.mail.example.com`). If not provided, uses native `dns.resolveTlsa` when available
     - **checkDnssecSecure(hostname)** - optional async function to check DNSSEC validation status of an MX host before attempting TLSA lookups ([RFC 7672 Section 2.2.2](https://datatracker.ietf.org/doc/html/rfc7672#section-2.2.2)). Should return `{ secure: boolean }`. When provided and the zone is insecure, TLSA lookups are skipped and the connection falls back to opportunistic TLS. See [DNSSEC-Aware DANE](#dnssec-aware-dane) below
     - **logger(logObj)** - method to log DANE information, logging is disabled by default
-    - **verify** - if `true` (default), enforces DANE verification and rejects connections that fail. If `false`, only logs failures
+    - **verify** - *(deprecated, ignored)* DANE verification is always enforced when TLSA records are present, per RFC 7672. This option is accepted for backward compatibility but has no effect
 
 ### Connection object
 
@@ -215,17 +215,17 @@ const connection = await mxConnect({
 });
 ```
 
-When `checkDnssecSecure` reports that a zone is insecure, mx-connect skips the TLSA lookup for that MX host and falls back to opportunistic TLS. If the callback itself throws an error, the zone is assumed insecure (safe default). If `checkDnssecSecure` is not provided, the existing behavior is preserved and TLSA lookups are attempted for all MX hosts.
+When `checkDnssecSecure` reports that a zone is insecure (`{ secure: false }`), mx-connect skips the TLSA lookup for that MX host and falls back to opportunistic TLS. If the callback itself throws an error (e.g. DNS timeout), the MX is marked as having a DANE lookup failure and the connection is rejected with a temporary error, preserving DANE enforcement across retries. If `checkDnssecSecure` is not provided, the existing behavior is preserved and TLSA lookups are attempted for all MX hosts.
 
 ### DANE Verification Flow
 
 When DANE is enabled, the following flow occurs:
 
-1. **DNSSEC Check** (optional): If `checkDnssecSecure` is provided, the DNSSEC validation status of each MX host's A/AAAA records is checked. Hosts in insecure zones skip directly to step 5
+1. **DNSSEC Check** (optional): If `checkDnssecSecure` is provided, the DNSSEC validation status of each MX host's A/AAAA records is checked. Hosts in insecure zones (`{ secure: false }`) skip directly to step 5. If the check itself fails (DNS error), the MX is marked as a DANE lookup failure and the connection is rejected with a temporary error
 2. **TLSA Lookup**: For hosts in DNSSEC-signed zones (or when `checkDnssecSecure` is not provided), mx-connect resolves TLSA records for each MX hostname (e.g., `_25._tcp.mail.example.com`)
 3. **Connection**: A TCP connection is established to the MX server
-4. **TLS Upgrade**: When upgrading to TLS (STARTTLS), use the `connection.daneVerifier` function as the `checkServerIdentity` option
-5. **Certificate Verification**: The server's certificate is verified against the TLSA records (or opportunistic TLS is used if no TLSA records were found)
+4. **TLS Upgrade**: When upgrading to TLS (STARTTLS), use the `connection.daneVerifier` function as the `checkServerIdentity` option. Pass the certificate chain (from `socket.getPeerCertificate(true)`) as the third argument for DANE-TA/PKIX-TA support
+5. **Certificate Verification**: The server's certificate (and chain, if provided) is verified against the TLSA records (or opportunistic TLS is used if no TLSA records were found)
 
 ### TLSA Record Format
 
@@ -245,12 +245,12 @@ TLSA records returned by the resolver should have the following structure:
 
 | Usage | Name    | Description                                             | Support Status |
 | ----- | ------- | ------------------------------------------------------- | -------------- |
-| 0     | PKIX-TA | CA constraint - must chain to specified CA              | ⚠️ Limited\*   |
+| 0     | PKIX-TA | CA constraint - must chain to specified CA              | ✅ Full\*       |
 | 1     | PKIX-EE | Service certificate constraint - must match exactly     | ✅ Full        |
-| 2     | DANE-TA | Trust anchor assertion - specified cert is trust anchor | ⚠️ Limited\*   |
+| 2     | DANE-TA | Trust anchor assertion - specified cert is trust anchor | ✅ Full\*       |
 | 3     | DANE-EE | Domain-issued certificate - certificate must match      | ✅ Full        |
 
-> **\*Note on DANE-TA and PKIX-TA**: These usage types require access to the full certificate chain, which is not available in the standard TLS `checkServerIdentity` callback. Currently, only the end-entity (leaf) certificate is verified. If the TLSA record matches the end-entity certificate, verification will succeed; otherwise, it will fail even if the record matches a CA certificate in the chain. For most SMTP deployments, DANE-EE (usage=3) is recommended as it provides the strongest security guarantees and is fully supported.
+> **\*Note on DANE-TA and PKIX-TA**: These usage types require access to the full certificate chain. The `createDaneVerifier` function returned by this module accepts an optional `chain` parameter (an array of `X509Certificate` objects) that enables DANE-TA and PKIX-TA verification against CA certificates in the chain. When the chain is not provided, only the end-entity (leaf) certificate is verified and DANE-TA/PKIX-TA records will fail to match. For most SMTP deployments, DANE-EE (usage=3) is recommended as it provides the strongest security guarantees.
 
 ### Combining DANE with MTA-STS
 
@@ -287,8 +287,8 @@ console.log('DANE Usage Types:', dane.DANE_USAGE);
 console.log('DANE Selectors:', dane.DANE_SELECTOR);
 console.log('DANE Matching Types:', dane.DANE_MATCHING_TYPE);
 
-// Verify a certificate against TLSA records
-const result = dane.verifyCertAgainstTlsa(certificate, tlsaRecords);
+// Verify a certificate against TLSA records (with optional chain for DANE-TA)
+const result = dane.verifyCertAgainstTlsa(certificate, tlsaRecords, chain);
 ```
 
 ## License
