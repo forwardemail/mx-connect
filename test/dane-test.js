@@ -1274,3 +1274,86 @@ module.exports.extractSPKIPubkeyIsNotSPKI = test => {
     test.ok(spkiDer.equals(result), 'extractSPKI should return correct SPKI, not raw pubkey');
     test.done();
 };
+
+/**
+ * Test toBuffer handles JSON-deserialized Buffer objects from Redis/cache.
+ *
+ * When a Buffer is stored in Redis (or any JSON-based cache) and retrieved,
+ * JSON.parse(JSON.stringify(buf)) produces a plain object:
+ *   {"type":"Buffer","data":[94,129,...]}
+ * instead of an actual Buffer instance. toBuffer must handle this pattern.
+ */
+module.exports.toBufferJsonDeserializedBuffer = test => {
+    const original = Buffer.from('5e81da1af16df20b', 'hex');
+    const deserialized = JSON.parse(JSON.stringify(original));
+
+    // Confirm the deserialized object is NOT a Buffer
+    test.ok(!Buffer.isBuffer(deserialized), 'JSON-deserialized Buffer should not be a Buffer');
+    test.equal(deserialized.type, 'Buffer', 'Should have type "Buffer"');
+    test.ok(Array.isArray(deserialized.data), 'Should have data array');
+
+    // toBuffer should recover the original Buffer
+    const result = dane.toBuffer(deserialized);
+    test.ok(Buffer.isBuffer(result), 'toBuffer should return a Buffer');
+    test.ok(original.equals(result), 'Recovered Buffer should equal original');
+    test.done();
+};
+
+/**
+ * Test that DANE verification works end-to-end when TLSA records have been
+ * through a JSON round-trip (simulating Redis cache storage and retrieval).
+ *
+ * This is the exact scenario that caused production failures: tangerine
+ * resolves TLSA records with cert as a Buffer, the records get cached in
+ * Redis, and when retrieved the cert field is a plain object instead of
+ * a Buffer. verifyCertAgainstTlsa must handle this transparently.
+ */
+module.exports.verifyCertDaneEEWithJsonDeserializedTlsa = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const x509 = new nodeCrypto.X509Certificate(certDer);
+    const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
+
+    // Simulate what tangerine returns (cert is a real Buffer)
+    const freshRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: spkiHash
+    }];
+
+    // Simulate Redis round-trip: JSON.stringify then JSON.parse
+    const cachedRecords = JSON.parse(JSON.stringify(freshRecords));
+
+    // Confirm the cert field is no longer a Buffer
+    test.ok(!Buffer.isBuffer(cachedRecords[0].cert), 'Cached cert should not be a Buffer');
+    test.equal(cachedRecords[0].cert.type, 'Buffer', 'Cached cert should have type "Buffer"');
+
+    // Verification should still succeed with cached (deserialized) records
+    const result = dane.verifyCertAgainstTlsa(x509, cachedRecords);
+    test.equal(result.valid, true, 'DANE verification should succeed with cached TLSA records');
+    test.equal(result.usage, 'DANE-EE', 'Should report DANE-EE usage');
+    test.done();
+};
+
+/**
+ * Test that DANE verification FAILS with cached records when toBuffer
+ * does NOT handle the deserialized pattern (regression guard).
+ * This test uses a wrong hash to confirm the comparison still works correctly.
+ */
+module.exports.verifyCertDaneEEWithJsonDeserializedTlsaWrongHash = test => {
+    const { certDer } = generateTestCert();
+    const x509 = new nodeCrypto.X509Certificate(certDer);
+
+    // Wrong hash, but JSON-deserialized format
+    const wrongHash = Buffer.alloc(32, 0xff);
+    const cachedRecords = JSON.parse(JSON.stringify([{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: wrongHash
+    }]));
+
+    const result = dane.verifyCertAgainstTlsa(x509, cachedRecords);
+    test.equal(result.valid, false, 'Should reject wrong hash even from cached records');
+    test.done();
+};
