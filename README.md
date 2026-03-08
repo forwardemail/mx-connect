@@ -98,6 +98,7 @@ You can use a domain name or an email address as the target, for additional conf
 - **dane** is an object for DANE/TLSA configuration (see [DANE Support](#dane-support) section below)
     - **enabled** - must be set to `true` to enable DANE verification
     - **resolveTlsa(tlsaName)** - custom async function to resolve TLSA records. Receives the full TLSA query name (e.g., `_25._tcp.mail.example.com`). If not provided, uses native `dns.resolveTlsa` when available
+    - **checkDnssecSecure(hostname)** - optional async function to check DNSSEC validation status of an MX host before attempting TLSA lookups ([RFC 7672 Section 2.2.2](https://datatracker.ietf.org/doc/html/rfc7672#section-2.2.2)). Should return `{ secure: boolean }`. When provided and the zone is insecure, TLSA lookups are skipped and the connection falls back to opportunistic TLS. See [DNSSEC-Aware DANE](#dnssec-aware-dane) below
     - **logger(logObj)** - method to log DANE information, logging is disabled by default
     - **verify** - if `true` (default), enforces DANE verification and rejects connections that fail. If `false`, only logs failures
 
@@ -127,11 +128,14 @@ DANE (DNS-based Authentication of Named Entities) provides a way to authenticate
 
 Currently, Node.js does not expose the DNSSEC AD (Authenticated Data) flag from DNS responses, which means applications cannot verify that TLSA records were DNSSEC-validated by the resolver. This is tracked in [nodejs/node#57159](https://github.com/nodejs/node/issues/57159).
 
+However, applications that use a DNS-over-HTTPS (DoH) resolver or a custom DNS library with access to raw DNS response packets can check the AD flag themselves. The `dane.checkDnssecSecure` callback provides a way to integrate this check into the DANE pipeline, allowing mx-connect to skip TLSA lookups for MX hosts whose zones are not DNSSEC-signed. This prevents delivery failures caused by nameservers that return SERVFAIL for TLSA queries on unsigned zones (see [RFC 7672 Section 2.2.2](https://datatracker.ietf.org/doc/html/rfc7672#section-2.2.2) and [DNSSEC-Aware DANE](#dnssec-aware-dane) below).
+
 **Recommendations for production use:**
 
 1. **Use a DNSSEC-validating resolver** - Configure your system to use a resolver that performs DNSSEC validation (e.g., Cloudflare's 1.1.1.1, Google's 8.8.8.8, or a local validating resolver like Unbound)
 2. **Use DNS-over-HTTPS (DoH)** - A DoH resolver provides transport security via HTTPS, which protects against on-path attackers (though this is not a substitute for DNSSEC validation)
-3. **Monitor nodejs/node#57159** - When Node.js adds AD flag support, this module will be updated to optionally require DNSSEC validation
+3. **Use `checkDnssecSecure`** - If your DNS resolver exposes the AD flag (e.g., via DoH raw responses), provide a `checkDnssecSecure` callback to skip TLSA lookups for insecure zones per RFC 7672
+4. **Monitor [nodejs/node#57159](https://github.com/nodejs/node/issues/57159)** - When Node.js adds AD flag support, this module will be updated to optionally require DNSSEC validation
 
 For domains with properly configured DNSSEC, DANE provides strong protection against certificate misissuance and man-in-the-middle attacks. For domains without DNSSEC, consider using MTA-STS as an alternative or complementary security mechanism.
 
@@ -177,14 +181,51 @@ if (connection.tlsaRecords) {
 // The verifier function can be passed to tls.connect() as checkServerIdentity
 ```
 
+### DNSSEC-Aware DANE
+
+[RFC 7672 Section 2.2.2](https://datatracker.ietf.org/doc/html/rfc7672#section-2.2.2) requires SMTP clients to check the DNSSEC validation status of MX host address records before attempting TLSA lookups. If the zone is not DNSSEC-signed ("insecure"), TLSA lookups should be skipped because:
+
+1. Secure TLSA records cannot exist in an unsigned zone
+2. Some nameservers for unsigned zones return SERVFAIL for TLSA queries (e.g., Microsoft Exchange Online Protection), which would cause delivery failures
+
+The `checkDnssecSecure` callback enables this check. It receives an MX hostname and should return `{ secure: boolean }` indicating whether the zone is DNSSEC-signed.
+
+```javascript
+const mxConnect = require('mx-connect');
+
+const connection = await mxConnect({
+    target: 'user@example.com',
+    dane: {
+        enabled: true,
+        resolveTlsa: customResolveTlsa,
+        // RFC 7672 Section 2.2.2: Check DNSSEC status before TLSA lookups.
+        // Uses the AD (Authenticated Data) flag from the DNS response to
+        // determine if the MX host's zone is DNSSEC-signed.
+        async checkDnssecSecure(hostname) {
+            try {
+                // Check A record first (covers most MX hosts)
+                return await resolver.resolve(hostname, 'A', { dnssecSecure: true });
+            } catch {
+                // Fall back to AAAA for IPv6-only hosts
+                return resolver.resolve(hostname, 'AAAA', { dnssecSecure: true });
+            }
+        },
+        logger: console.log
+    }
+});
+```
+
+When `checkDnssecSecure` reports that a zone is insecure, mx-connect skips the TLSA lookup for that MX host and falls back to opportunistic TLS. If the callback itself throws an error, the zone is assumed insecure (safe default). If `checkDnssecSecure` is not provided, the existing behavior is preserved and TLSA lookups are attempted for all MX hosts.
+
 ### DANE Verification Flow
 
 When DANE is enabled, the following flow occurs:
 
-1. **TLSA Lookup**: Before connecting, mx-connect resolves TLSA records for each MX hostname (e.g., `_25._tcp.mail.example.com`)
-2. **Connection**: A TCP connection is established to the MX server
-3. **TLS Upgrade**: When upgrading to TLS (STARTTLS), use the `connection.daneVerifier` function as the `checkServerIdentity` option
-4. **Certificate Verification**: The server's certificate is verified against the TLSA records
+1. **DNSSEC Check** (optional): If `checkDnssecSecure` is provided, the DNSSEC validation status of each MX host's A/AAAA records is checked. Hosts in insecure zones skip directly to step 5
+2. **TLSA Lookup**: For hosts in DNSSEC-signed zones (or when `checkDnssecSecure` is not provided), mx-connect resolves TLSA records for each MX hostname (e.g., `_25._tcp.mail.example.com`)
+3. **Connection**: A TCP connection is established to the MX server
+4. **TLS Upgrade**: When upgrading to TLS (STARTTLS), use the `connection.daneVerifier` function as the `checkServerIdentity` option
+5. **Certificate Verification**: The server's certificate is verified against the TLSA records (or opportunistic TLS is used if no TLSA records were found)
 
 ### TLSA Record Format
 
@@ -224,7 +265,8 @@ const connection = await mxConnect({
     },
     dane: {
         enabled: true,
-        resolveTlsa: customResolveTlsa
+        resolveTlsa: customResolveTlsa,
+        checkDnssecSecure: customCheckDnssecSecure // optional, see DNSSEC-Aware DANE
     }
 });
 // Both MTA-STS and DANE checks are performed

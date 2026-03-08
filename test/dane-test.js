@@ -836,3 +836,524 @@ module.exports.verifyCertWithStringCertData = test => {
 
     test.done();
 };
+
+
+/**
+ * Helper: generate a real self-signed EC P-256 certificate.
+ * Returns { certDer, spkiDer, publicKey } where:
+ *   certDer  — full certificate in DER format (valid for X509Certificate)
+ *   spkiDer  — SubjectPublicKeyInfo in DER format (91 bytes for P-256)
+ *   publicKey — KeyObject
+ */
+function generateTestCert() {
+    const fs = require('fs');
+    const { execSync } = require('child_process');
+    const pid = process.pid;
+    const tmpKey = `/tmp/_dane_test_key_${pid}.pem`;
+    const tmpCert = `/tmp/_dane_test_cert_${pid}.der`;
+    const { privateKey, publicKey } = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+    fs.writeFileSync(tmpKey, privateKey.export({ type: 'pkcs8', format: 'pem' }));
+    execSync(`openssl req -new -x509 -key ${tmpKey} -subj "/CN=dane-test" -days 1 -outform DER -out ${tmpCert}`);
+    const certDer = fs.readFileSync(tmpCert);
+    try { fs.unlinkSync(tmpKey); } catch { /* ignore */ }
+    try { fs.unlinkSync(tmpCert); } catch { /* ignore */ }
+    const x509 = new nodeCrypto.X509Certificate(certDer);
+    const spkiDer = x509.publicKey.export({ type: 'spki', format: 'der' });
+    return { certDer, spkiDer, publicKey };
+}
+
+/**
+ * Build a mock raw peer cert (as returned by tls.getPeerCertificate()).
+ * .raw   = full DER certificate (valid)
+ * .pubkey = raw public key bytes (NOT SPKI — this is what Node.js actually provides)
+ */
+function makeRawPeerCert(certDer, spkiDer) {
+    return {
+        raw: certDer,
+        // Node's getPeerCertificate().pubkey is the raw key, not SPKI.
+        // For EC P-256: 65 bytes (04 || X || Y), whereas SPKI is 91 bytes.
+        pubkey: Buffer.from(spkiDer.subarray(spkiDer.length - 65))
+    };
+}
+
+/**
+ * Test extractSPKI with raw peer certificate (has .raw DER)
+ *
+ * Raw peer certs from tls.getPeerCertificate() have .pubkey (raw key bytes)
+ * and .raw (full DER cert). extractSPKI must use .raw to reconstruct the
+ * correct SPKI, because .pubkey is NOT the SPKI.
+ */
+module.exports.extractSPKIRawPeerCert = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const result = dane.extractSPKI(rawPeerCert);
+    test.ok(Buffer.isBuffer(result), 'Should return a Buffer');
+    test.ok(spkiDer.equals(result), 'Should return the correct SPKI DER');
+    test.equal(result.length, spkiDer.length, 'Buffer length should match SPKI DER');
+    test.done();
+};
+
+/**
+ * Test extractSPKI with X509Certificate object (.publicKey KeyObject)
+ */
+module.exports.extractSPKIX509Certificate = test => {
+    const { certDer, spkiDer, publicKey } = generateTestCert();
+
+    // Simulate an X509Certificate object: .publicKey is a KeyObject.
+    const mockX509 = {
+        publicKey, // KeyObject (PublicKeyObject)
+        raw: certDer
+    };
+
+    const result = dane.extractSPKI(mockX509);
+    test.ok(Buffer.isBuffer(result), 'Should return a Buffer');
+    test.ok(spkiDer.equals(result), 'Should match the exported SPKI DER');
+    test.done();
+};
+
+/**
+ * Test extractSPKI with PEM-encoded public key string
+ */
+module.exports.extractSPKIPemString = test => {
+    const { spkiDer, publicKey } = generateTestCert();
+    const spkiPem = publicKey.export({ type: 'spki', format: 'pem' });
+
+    const mockCert = {
+        publicKey: spkiPem // PEM string
+    };
+
+    const result = dane.extractSPKI(mockCert);
+    test.ok(Buffer.isBuffer(result), 'Should return a Buffer');
+    test.ok(spkiDer.equals(result), 'PEM extraction should match DER');
+    test.done();
+};
+
+/**
+ * Test extractSPKI returns consistent results for raw peer cert and X509Certificate
+ *
+ * Both cert representations must produce the same SPKI DER output.
+ */
+module.exports.extractSPKIConsistentAcrossCertTypes = test => {
+    const { certDer, spkiDer, publicKey } = generateTestCert();
+
+    // Simulate raw peer cert
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    // Simulate X509Certificate
+    const x509Cert = { publicKey };
+
+    const result1 = dane.extractSPKI(rawPeerCert);
+    const result2 = dane.extractSPKI(x509Cert);
+
+    test.ok(Buffer.isBuffer(result1), 'Raw peer cert result should be a Buffer');
+    test.ok(Buffer.isBuffer(result2), 'X509Certificate result should be a Buffer');
+    test.ok(result1.equals(result2), 'Both cert types should produce identical SPKI');
+    test.done();
+};
+
+/**
+ * Test full DANE-EE (usage=3) SPKI SHA-256 verification with raw peer cert
+ *
+ * This is the most common DANE configuration (e.g., mx1.forwardemail.net).
+ * Verifies the complete pipeline: extractSPKI → hash → compare against TLSA.
+ */
+module.exports.verifyCertDaneEESPKISha256RawPeerCert = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: spkiHash
+    }];
+
+    const result = dane.verifyCertAgainstTlsa(rawPeerCert, tlsaRecords);
+    test.equal(result.valid, true, 'DANE-EE SPKI SHA-256 should verify against raw peer cert');
+    test.equal(result.usage, 'DANE-EE', 'Should report DANE-EE usage');
+    test.ok(result.matchedRecord, 'Should have a matched record');
+    test.equal(result.matchedRecord.usage, 3, 'Matched record usage should be 3');
+    test.equal(result.matchedRecord.selector, 1, 'Matched record selector should be 1');
+    test.done();
+};
+
+/**
+ * Test full DANE-EE (usage=3) SPKI SHA-256 verification with X509Certificate
+ */
+module.exports.verifyCertDaneEESPKISha256X509Certificate = test => {
+    const { certDer, spkiDer, publicKey } = generateTestCert();
+    const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
+
+    // Simulate X509Certificate
+    const x509Cert = {
+        raw: certDer,
+        publicKey // KeyObject
+    };
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: spkiHash
+    }];
+
+    const result = dane.verifyCertAgainstTlsa(x509Cert, tlsaRecords);
+    test.equal(result.valid, true, 'DANE-EE SPKI SHA-256 should verify against X509Certificate');
+    test.equal(result.usage, 'DANE-EE', 'Should report DANE-EE usage');
+    test.done();
+};
+
+/**
+ * Test DANE-EE SPKI SHA-512 verification
+ */
+module.exports.verifyCertDaneEESPKISha512 = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const spkiHash = nodeCrypto.createHash('sha512').update(spkiDer).digest();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 2, // SHA-512
+        cert: spkiHash
+    }];
+
+    const result = dane.verifyCertAgainstTlsa(rawPeerCert, tlsaRecords);
+    test.equal(result.valid, true, 'DANE-EE SPKI SHA-512 should verify');
+    test.equal(result.usage, 'DANE-EE', 'Should report DANE-EE usage');
+    test.done();
+};
+
+/**
+ * Test DANE-EE SPKI full match (mtype=0, no hash)
+ */
+module.exports.verifyCertDaneEESPKIFullMatch = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 0, // Full match
+        cert: spkiDer
+    }];
+
+    const result = dane.verifyCertAgainstTlsa(rawPeerCert, tlsaRecords);
+    test.equal(result.valid, true, 'DANE-EE SPKI full match should verify');
+    test.done();
+};
+
+/**
+ * Test DANE-EE verification fails with wrong TLSA hash
+ */
+module.exports.verifyCertDaneEEWrongHash = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: Buffer.alloc(32, 0xAB) // Wrong hash
+    }];
+
+    const result = dane.verifyCertAgainstTlsa(rawPeerCert, tlsaRecords);
+    test.equal(result.valid, false, 'Should fail with wrong TLSA hash');
+    test.ok(result.error, 'Should have error message');
+    test.ok(result.error.includes('did not match'), 'Error should mention no match');
+    test.done();
+};
+
+/**
+ * Test DANE-EE full cert (selector=0) verification
+ */
+module.exports.verifyCertDaneEEFullCertSelector = test => {
+    const { certDer } = generateTestCert();
+    const certHash = nodeCrypto.createHash('sha256').update(certDer).digest();
+
+    const rawPeerCert = {
+        raw: certDer,
+        pubkey: Buffer.from('irrelevant-for-selector-0')
+    };
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 0, // Full cert
+        mtype: 1,    // SHA-256
+        cert: certHash
+    }];
+
+    const result = dane.verifyCertAgainstTlsa(rawPeerCert, tlsaRecords);
+    test.equal(result.valid, true, 'DANE-EE full cert SHA-256 should verify');
+    test.equal(result.usage, 'DANE-EE', 'Should report DANE-EE usage');
+    test.done();
+};
+
+/**
+ * Test PKIX-EE (usage=1) SPKI verification with raw peer cert
+ */
+module.exports.verifyCertPkixEESPKI = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const tlsaRecords = [{
+        usage: 1, // PKIX-EE
+        selector: 1,
+        mtype: 1,
+        cert: spkiHash
+    }];
+
+    const result = dane.verifyCertAgainstTlsa(rawPeerCert, tlsaRecords);
+    test.equal(result.valid, true, 'PKIX-EE SPKI SHA-256 should verify');
+    test.equal(result.usage, 'PKIX-EE', 'Should report PKIX-EE usage');
+    test.done();
+};
+
+/**
+ * Test createDaneVerifier end-to-end with correct TLSA (should pass)
+ */
+module.exports.createDaneVerifierE2ECorrectTlsa = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: spkiHash
+    }];
+
+    let logMessages = [];
+    const verifier = dane.createDaneVerifier(tlsaRecords, {
+        verify: true,
+        logger: entry => logMessages.push(entry)
+    });
+
+    const result = verifier('mail.example.com', rawPeerCert);
+    test.equal(result, undefined, 'Should return undefined (success) for matching TLSA');
+
+    const successLog = logMessages.find(l => l.msg === 'DANE verification succeeded');
+    test.ok(successLog, 'Should log DANE verification succeeded');
+    test.equal(successLog.usage, 'DANE-EE', 'Log should report DANE-EE');
+    test.done();
+};
+
+/**
+ * Test createDaneVerifier end-to-end with wrong TLSA (should fail)
+ */
+module.exports.createDaneVerifierE2EWrongTlsa = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: Buffer.alloc(32, 0xAB) // Wrong hash
+    }];
+
+    let logMessages = [];
+    const verifier = dane.createDaneVerifier(tlsaRecords, {
+        verify: true,
+        logger: entry => logMessages.push(entry)
+    });
+
+    const result = verifier('mail.example.com', rawPeerCert);
+    test.ok(result instanceof Error, 'Should return an Error for non-matching TLSA');
+    test.equal(result.code, 'DANE_VERIFICATION_FAILED', 'Error code should be DANE_VERIFICATION_FAILED');
+    test.ok(result.message.includes('mail.example.com'), 'Error should include hostname');
+
+    const failLog = logMessages.find(l => l.msg === 'DANE verification failed');
+    test.ok(failLog, 'Should log DANE verification failed');
+    test.done();
+};
+
+/**
+ * Test createDaneVerifier with verify:false logs failure but returns undefined
+ */
+module.exports.createDaneVerifierVerifyFalseLogsButPasses = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: Buffer.alloc(32, 0xAB) // Wrong hash
+    }];
+
+    let logMessages = [];
+    const verifier = dane.createDaneVerifier(tlsaRecords, {
+        verify: false,
+        logger: entry => logMessages.push(entry)
+    });
+
+    const result = verifier('mail.example.com', rawPeerCert);
+    test.equal(result, undefined, 'Should return undefined (pass) when verify is false');
+
+    const failLog = logMessages.find(l => l.msg === 'DANE verification failed');
+    test.ok(failLog, 'Should still log DANE verification failed');
+    test.done();
+};
+
+/**
+ * Test createDaneVerifier with X509Certificate-style cert
+ */
+module.exports.createDaneVerifierE2EX509Certificate = test => {
+    const { certDer, spkiDer, publicKey } = generateTestCert();
+    const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
+
+    // Simulate X509Certificate (has .publicKey as KeyObject)
+    const x509Cert = {
+        raw: certDer,
+        publicKey
+    };
+
+    const tlsaRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: spkiHash
+    }];
+
+    const verifier = dane.createDaneVerifier(tlsaRecords, { verify: true, logger: () => {} });
+    const result = verifier('mail.example.com', x509Cert);
+    test.equal(result, undefined, 'Should return undefined (success) for X509Certificate with matching TLSA');
+    test.done();
+};
+
+/**
+ * Test that multiple TLSA records are tried and first match wins
+ */
+module.exports.verifyCertMultipleTlsaRecordsFirstMatchWins = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    const tlsaRecords = [
+        {
+            usage: 3,
+            selector: 1,
+            mtype: 1,
+            cert: Buffer.alloc(32, 0xAB) // Wrong — won't match
+        },
+        {
+            usage: 3,
+            selector: 1,
+            mtype: 1,
+            cert: spkiHash // Correct — should match
+        }
+    ];
+
+    const result = dane.verifyCertAgainstTlsa(rawPeerCert, tlsaRecords);
+    test.equal(result.valid, true, 'Should match the second TLSA record');
+    test.ok(result.matchedRecord.cert.equals(spkiHash), 'Matched record should be the correct one');
+    test.done();
+};
+
+/**
+ * Test that cert.pubkey (raw key) is NOT the same as SPKI DER,
+ * proving the bug that existed when extractSPKI returned cert.pubkey directly.
+ */
+module.exports.extractSPKIPubkeyIsNotSPKI = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const rawPeerCert = makeRawPeerCert(certDer, spkiDer);
+
+    // cert.pubkey is the raw EC point (65 bytes), NOT the SPKI (91 bytes)
+    test.notEqual(rawPeerCert.pubkey.length, spkiDer.length,
+        'Raw pubkey length should differ from SPKI length');
+    test.ok(!rawPeerCert.pubkey.equals(spkiDer),
+        'Raw pubkey should NOT equal SPKI DER');
+
+    // But extractSPKI should return the correct SPKI
+    const result = dane.extractSPKI(rawPeerCert);
+    test.ok(spkiDer.equals(result), 'extractSPKI should return correct SPKI, not raw pubkey');
+    test.done();
+};
+
+/**
+ * Test toBuffer handles JSON-deserialized Buffer objects from Redis/cache.
+ *
+ * When a Buffer is stored in Redis (or any JSON-based cache) and retrieved,
+ * JSON.parse(JSON.stringify(buf)) produces a plain object:
+ *   {"type":"Buffer","data":[94,129,...]}
+ * instead of an actual Buffer instance. toBuffer must handle this pattern.
+ */
+module.exports.toBufferJsonDeserializedBuffer = test => {
+    const original = Buffer.from('5e81da1af16df20b', 'hex');
+    const deserialized = JSON.parse(JSON.stringify(original));
+
+    // Confirm the deserialized object is NOT a Buffer
+    test.ok(!Buffer.isBuffer(deserialized), 'JSON-deserialized Buffer should not be a Buffer');
+    test.equal(deserialized.type, 'Buffer', 'Should have type "Buffer"');
+    test.ok(Array.isArray(deserialized.data), 'Should have data array');
+
+    // toBuffer should recover the original Buffer
+    const result = dane.toBuffer(deserialized);
+    test.ok(Buffer.isBuffer(result), 'toBuffer should return a Buffer');
+    test.ok(original.equals(result), 'Recovered Buffer should equal original');
+    test.done();
+};
+
+/**
+ * Test that DANE verification works end-to-end when TLSA records have been
+ * through a JSON round-trip (simulating Redis cache storage and retrieval).
+ *
+ * This is the exact scenario that caused production failures: tangerine
+ * resolves TLSA records with cert as a Buffer, the records get cached in
+ * Redis, and when retrieved the cert field is a plain object instead of
+ * a Buffer. verifyCertAgainstTlsa must handle this transparently.
+ */
+module.exports.verifyCertDaneEEWithJsonDeserializedTlsa = test => {
+    const { certDer, spkiDer } = generateTestCert();
+    const x509 = new nodeCrypto.X509Certificate(certDer);
+    const spkiHash = nodeCrypto.createHash('sha256').update(spkiDer).digest();
+
+    // Simulate what tangerine returns (cert is a real Buffer)
+    const freshRecords = [{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: spkiHash
+    }];
+
+    // Simulate Redis round-trip: JSON.stringify then JSON.parse
+    const cachedRecords = JSON.parse(JSON.stringify(freshRecords));
+
+    // Confirm the cert field is no longer a Buffer
+    test.ok(!Buffer.isBuffer(cachedRecords[0].cert), 'Cached cert should not be a Buffer');
+    test.equal(cachedRecords[0].cert.type, 'Buffer', 'Cached cert should have type "Buffer"');
+
+    // Verification should still succeed with cached (deserialized) records
+    const result = dane.verifyCertAgainstTlsa(x509, cachedRecords);
+    test.equal(result.valid, true, 'DANE verification should succeed with cached TLSA records');
+    test.equal(result.usage, 'DANE-EE', 'Should report DANE-EE usage');
+    test.done();
+};
+
+/**
+ * Test that DANE verification FAILS with cached records when toBuffer
+ * does NOT handle the deserialized pattern (regression guard).
+ * This test uses a wrong hash to confirm the comparison still works correctly.
+ */
+module.exports.verifyCertDaneEEWithJsonDeserializedTlsaWrongHash = test => {
+    const { certDer } = generateTestCert();
+    const x509 = new nodeCrypto.X509Certificate(certDer);
+
+    // Wrong hash, but JSON-deserialized format
+    const wrongHash = Buffer.alloc(32, 0xff);
+    const cachedRecords = JSON.parse(JSON.stringify([{
+        usage: 3,
+        selector: 1,
+        mtype: 1,
+        cert: wrongHash
+    }]));
+
+    const result = dane.verifyCertAgainstTlsa(x509, cachedRecords);
+    test.equal(result.valid, false, 'Should reject wrong hash even from cached records');
+    test.done();
+};
